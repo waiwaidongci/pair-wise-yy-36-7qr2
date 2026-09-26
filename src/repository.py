@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .domain import ConflictError, NotFoundError, ValidationError
+from .rules import ID_PREFIX, REVISABLE_FIELDS, STATES
 
 
 class Repository:
@@ -52,7 +52,27 @@ class Repository:
                     external_ref TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    review_batch INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(item_id, external_ref)
+                );
+                CREATE TABLE IF NOT EXISTS revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    batch INTEGER NOT NULL,
+                    field TEXT NOT NULL,
+                    old_value TEXT NOT NULL,
+                    new_value TEXT NOT NULL,
+                    material_ref TEXT NOT NULL,
+                    item_version INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','applied')),
+                    old_conclusion TEXT NOT NULL,
+                    new_conclusion TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    applied_by TEXT,
+                    applied_at TEXT,
+                    UNIQUE(item_id, batch)
                 );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +86,11 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(records)")}
+        if "review_batch" not in columns:
+            with self.conn:
+                self.conn.execute(
+                    "ALTER TABLE records ADD COLUMN review_batch INTEGER NOT NULL DEFAULT 0")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -156,6 +181,93 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    @staticmethod
+    def _revision(row: sqlite3.Row) -> Dict[str, Any]:
+        revision = dict(row)
+        revision["old_value"] = json.loads(revision["old_value"])
+        revision["new_value"] = json.loads(revision["new_value"])
+        revision["old_conclusion"] = json.loads(revision["old_conclusion"])
+        revision["new_conclusion"] = json.loads(revision["new_conclusion"])
+        return revision
+
+    def create_revision(self, item_id: int, field: str, old_value: Any, new_value: Any,
+                        material_ref: str, item_version: int, old_conclusion: dict,
+                        new_conclusion: dict, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(batch), 0) + 1 AS batch FROM revisions WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            batch = int(row["batch"])
+            cur = self.conn.execute(
+                """INSERT INTO revisions(item_id, batch, field, old_value, new_value,
+                   material_ref, item_version, status, old_conclusion, new_conclusion,
+                   created_by, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (item_id, batch, field, json.dumps(old_value), json.dumps(new_value),
+                 material_ref, item_version, "pending", json.dumps(old_conclusion, sort_keys=True),
+                 json.dumps(new_conclusion, sort_keys=True), actor, now),
+            )
+            revision_id = int(cur.lastrowid)
+        return self.get_revision(revision_id)
+
+    def get_revision(self, revision_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM revisions WHERE id=?", (revision_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("修订不存在")
+        return self._revision(row)
+
+    def list_revisions(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM revisions WHERE item_id=? ORDER BY id", (item_id,)).fetchall()
+        return [self._revision(row) for row in rows]
+
+    def pending_revision_count(self, item_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM revisions WHERE item_id=? AND status='pending'",
+                (item_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    def latest_applied_batch(self, item_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COALESCE(MAX(batch), 0) AS batch FROM revisions
+                   WHERE item_id=? AND status='applied'""",
+                (item_id,),
+            ).fetchone()
+        return int(row["batch"])
+
+    def apply_revision(self, item_id: int, revision_id: int, field: str, new_value: Any,
+                       batch: int, actor: str) -> tuple:
+        if field not in REVISABLE_FIELDS:
+            raise ValidationError("field不允许修订")
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE revisions SET status='applied', applied_by=?, applied_at=?
+                   WHERE id=? AND item_id=? AND status='pending'""",
+                (actor, now, revision_id, item_id),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("修订已处理或不存在")
+            self.conn.execute(
+                f"UPDATE items SET {field}=?, version=version+1, updated_at=? WHERE id=?",
+                (new_value, now, item_id),
+            )
+            cur = self.conn.execute(
+                "UPDATE records SET review_batch=? WHERE item_id=? AND status='open'",
+                (batch, item_id),
+            )
+            rejudged = int(cur.rowcount)
+        return self.get_item(item_id), rejudged
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
