@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, REVISION_STATES, STATES
 
 
 class Repository:
@@ -24,6 +24,7 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        revision_states = ",".join("'" + s.replace("'", "''") + "'" for s in REVISION_STATES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -54,6 +55,26 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    batch INTEGER NOT NULL,
+                    original_value REAL NOT NULL,
+                    new_value REAL NOT NULL,
+                    material_ref TEXT NOT NULL,
+                    item_version INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ({revision_states})),
+                    old_conclusion TEXT,
+                    new_conclusion TEXT,
+                    review_note TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_revisions_item_batch
+                    ON revisions(item_id, batch);
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -156,6 +177,132 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    @staticmethod
+    def _revision(row: sqlite3.Row) -> Dict[str, Any]:
+        revision = dict(row)
+        for key in ("old_conclusion", "new_conclusion"):
+            if revision.get(key):
+                revision[key] = json.loads(revision[key])
+        return revision
+
+    def create_revision(self, item_id: int, original_value: float, new_value: float,
+                        material_ref: str, item_version: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(batch),0)+1 AS batch FROM revisions WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+            batch = int(row["batch"])
+            cur = self.conn.execute(
+                """INSERT INTO revisions(item_id, batch, original_value, new_value,
+                   material_ref, item_version, status, created_by, created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (item_id, batch, original_value, new_value, material_ref,
+                 item_version, REVISION_STATES[0], actor, now),
+            )
+            revision_id = int(cur.lastrowid)
+        return self.get_revision(revision_id)
+
+    def get_revision(self, revision_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM revisions WHERE id=?", (revision_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("修订不存在")
+        return self._revision(row)
+
+    def get_item_revision(self, item_id: int, revision_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM revisions WHERE id=? AND item_id=?",
+                (revision_id, item_id)).fetchone()
+        if row is None:
+            raise NotFoundError("修订不存在")
+        return self._revision(row)
+
+    def list_revisions(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM revisions WHERE item_id=? ORDER BY batch", (item_id,)
+            ).fetchall()
+        return [self._revision(row) for row in rows]
+
+    def pending_revision_count(self, item_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM revisions WHERE item_id=? AND status='pending'",
+                (item_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    def revision_stats(self, item_id: int) -> Dict[str, int]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COALESCE(MAX(CASE WHEN status='applied' THEN batch END),0) AS batch,
+                          SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending
+                   FROM revisions WHERE item_id=?""",
+                (item_id,),
+            ).fetchone()
+        return {"batch": int(row["batch"] or 0), "pending": int(row["pending"] or 0)}
+
+    def apply_revision(self, item_id: int, revision_id: int, new_value: float,
+                       old_conclusion: dict, new_conclusion: dict,
+                       rejudge_records: bool, actor: str):
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE revisions SET status='applied', old_conclusion=?, new_conclusion=?,
+                   reviewed_by=?, reviewed_at=?
+                   WHERE id=? AND item_id=? AND status='pending'""",
+                (json.dumps(old_conclusion, ensure_ascii=False, sort_keys=True),
+                 json.dumps(new_conclusion, ensure_ascii=False, sort_keys=True),
+                 actor, now, revision_id, item_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM revisions WHERE id=? AND item_id=?",
+                    (revision_id, item_id)).fetchone()
+                if exists is None:
+                    raise NotFoundError("修订不存在")
+                raise ConflictError("修订已处理，请刷新后重试")
+            self.conn.execute(
+                "UPDATE items SET quantity=?, version=version+1, updated_at=? WHERE id=?",
+                (new_value, now, item_id),
+            )
+            closed_ids: List[int] = []
+            if rejudge_records:
+                rows = self.conn.execute(
+                    "SELECT id FROM records WHERE item_id=? AND status='open'",
+                    (item_id,)).fetchall()
+                closed_ids = [int(row["id"]) for row in rows]
+                if closed_ids:
+                    self.conn.execute(
+                        "UPDATE records SET status='closed' WHERE item_id=? AND status='open'",
+                        (item_id,),
+                    )
+        return self.get_revision(revision_id), closed_ids
+
+    def reject_revision(self, item_id: int, revision_id: int,
+                        note: Optional[str], actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE revisions SET status='rejected', review_note=?,
+                   reviewed_by=?, reviewed_at=?
+                   WHERE id=? AND item_id=? AND status='pending'""",
+                (note, actor, now, revision_id, item_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM revisions WHERE id=? AND item_id=?",
+                    (revision_id, item_id)).fetchone()
+                if exists is None:
+                    raise NotFoundError("修订不存在")
+                raise ConflictError("修订已处理，请刷新后重试")
+        return self.get_revision(revision_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

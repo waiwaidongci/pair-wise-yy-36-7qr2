@@ -18,5 +18,14 @@ def can_transition(current,target): return target in TRANSITIONS.get(current,[])
 def validate_transition(current,target):
     if current not in STATES or target not in STATES: raise ValidationError("未知状态")
     if not can_transition(current,target): raise ConflictError(f"不能从{current}转换到{target}")
-def completion_blockers(target,open_records): return ["仍有未关闭事项"] if target in TERMINAL_STATES and open_records>0 else []
+def completion_blockers(target,open_records,pending_revisions=0):
+    if target not in TERMINAL_STATES: return []
+    blockers=[]
+    if pending_revisions>0: blockers.append("存在待复核修订，请先处理")
+    if open_records>0: blockers.append("仍有未关闭事项")
+    return blockers
 def role_for_transition(target): return set(TRANSITION_ROLES.get(target,[]))
+REVISION_STATES=['pending','applied','rejected']; REVISION_ROLES=set(['compliance_officer']); REVISION_REVIEW_ROLES=set(['compliance_officer','director'])
+def conclusion_snapshot(severity,quantity,threshold):
+    return {"quantity":quantity,"priority":priority_score(severity,quantity,threshold),"deadline_hours":response_deadline_hours(severity,quantity,threshold),"escalation_required":escalation_required(severity,quantity,threshold)}
+def should_rejudge_open_records(severity,quantity,threshold): return not escalation_required(severity,quantity,threshold)

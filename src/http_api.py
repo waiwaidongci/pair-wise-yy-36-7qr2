@@ -89,6 +89,11 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/revisions"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"revisions": service.list_revisions(item_id, role)})
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -119,6 +124,19 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/revisions"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.register_revision(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/apply"):
+                    parts = path.split("/")
+                    item_id, revision_id = int(parts[3]), int(parts[5])
+                    self._json(200, service.apply_revision(item_id, revision_id,
+                                                           actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/reject"):
+                    parts = path.split("/")
+                    item_id, revision_id = int(parts[3]), int(parts[5])
+                    self._json(200, service.reject_revision(item_id, revision_id,
+                                                            body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
